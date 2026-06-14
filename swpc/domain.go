@@ -2,7 +2,6 @@ package swpc
 
 import (
 	"context"
-	"net/url"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
@@ -15,21 +14,18 @@ import (
 //	import _ "github.com/tamnd/swpc-cli/swpc"
 //
 // exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// swpc:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone swpc binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
+// "github.com/lib/pq"`. The init below registers it; the host then routes
+// swpc:// URIs to the operations Register installs. The same Domain also
+// builds the standalone swpc binary (see cli.NewApp), so the binary and a
+// host share one source of truth.
 func init() { kit.Register(Domain{}) }
 
 // Domain is the swpc driver. It carries no state; the per-run client is
 // built by the factory Register hands kit.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme, the hostnames a pasted link is matched against,
+// and the identity reused for the binary's help and version.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "swpc",
@@ -39,45 +35,45 @@ func (Domain) Info() kit.DomainInfo {
 			Short:  "A command line for NOAA Space Weather Prediction Center.",
 			Long: `A command line for NOAA Space Weather Prediction Center.
 
-swpc reads public swpc data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+swpc reads real-time and recent space weather data from the NOAA SWPC public
+API, shapes it into clean records, and prints output that pipes into the rest
+of your tools. No API key, nothing to run alongside it.`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/swpc-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `swpc page` and
-	// `ant get swpc://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "kindex",
+		Group:   "read",
+		Summary: "Recent planetary K-index readings",
+	}, getKIndex)
 
-	// List op: members of a page, the home of `swpc links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// swpc://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "solarwind",
+		Group:   "read",
+		Summary: "Current solar wind speed",
+	}, getSolarWind)
 
-	// Search op: a free-text query, the home of `swpc search` and the
-	// search box a host (ant) shows for this domain. A top-level op named "search"
-	// is exactly what kit.Host.Searchable looks for. Like links it emits page
-	// stubs, so a host can follow any hit to its own swpc://page/ URI.
-	kit.Handle(app, kit.OpMeta{Name: "search", Group: "read",
-		Summary: "Search swpc",
-		Args:    []kit.Arg{{Name: "query", Help: "search query"}}}, searchPages)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "alerts",
+		Group:   "read",
+		Summary: "Space weather alerts and watches",
+	}, getAlerts)
+
+	kit.Handle(app, kit.OpMeta{
+		Name:    "flares",
+		Group:   "read",
+		Summary: "Recent solar flares (7 days)",
+	}, getFlares)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the client from the host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
 	c := NewClient()
 	if cfg.UserAgent != "" {
@@ -96,59 +92,69 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type kindexInput struct {
+	Limit  int     `kit:"flag,inherit" help:"max K-index records"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
+type solarwindInput struct {
 	Client *Client `kit:"inject"`
 }
 
-type searchRef struct {
-	Query  string  `kit:"arg" help:"search query"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
+type alertsInput struct {
+	Limit  int     `kit:"flag,inherit" help:"max alerts"`
+	Client *Client `kit:"inject"`
+}
+
+type flaresInput struct {
+	Limit  int     `kit:"flag,inherit" help:"max flares"`
 	Client *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func getKIndex(ctx context.Context, in kindexInput, emit func(*KIndex) error) error {
+	records, err := in.Client.GetKIndex(ctx, in.Limit)
 	if err != nil {
-		return mapErr(err)
+		return err
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
-	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for i := range records {
+		if err := emit(&records[i]); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func searchPages(ctx context.Context, in searchRef, emit func(*Page) error) error {
-	pages, err := in.Client.Search(ctx, in.Query, in.Limit)
+func getSolarWind(ctx context.Context, in solarwindInput, emit func(*SolarWind) error) error {
+	sw, err := in.Client.GetSolarWind(ctx)
 	if err != nil {
-		return mapErr(err)
+		return err
 	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	return emit(sw)
+}
+
+func getAlerts(ctx context.Context, in alertsInput, emit func(*SpaceAlert) error) error {
+	alerts, err := in.Client.GetAlerts(ctx, in.Limit)
+	if err != nil {
+		return err
+	}
+	for i := range alerts {
+		if err := emit(&alerts[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func getFlares(ctx context.Context, in flaresInput, emit func(*SolarFlare) error) error {
+	flares, err := in.Client.GetFlares(ctx, in.Limit)
+	if err != nil {
+		return err
+	}
+	for i := range flares {
+		if err := emit(&flares[i]); err != nil {
 			return err
 		}
 	}
@@ -157,44 +163,29 @@ func searchPages(ctx context.Context, in searchRef, emit func(*Page) error) erro
 
 // --- Resolver: the URI-native string functions, pure and network-free ---
 
-// Classify turns any accepted input — a bare path or a full swpc.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
+// Classify turns an accepted input into the canonical (type, id).
 func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized swpc reference: %q", input)
+	input = strings.TrimSpace(input)
+	// Dataset names
+	switch input {
+	case "kindex", "solarwind", "alerts", "flares":
+		return "dataset", input, nil
 	}
-	return "page", id, nil
+	// Solar flare class (e.g. "M2.1", "X1.5", "B3", "C4.2")
+	if len(input) > 0 && (input[0] == 'B' || input[0] == 'C' || input[0] == 'M' || input[0] == 'X') {
+		return "class", input, nil
+	}
+	// Date-like strings
+	if len(input) == 10 && input[4] == '-' && input[7] == '-' {
+		return "date", input, nil
+	}
+	return "", "", errs.Usage("unrecognized swpc reference: %q", input)
 }
 
 // Locate is the inverse: the live https URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	if uriType != "dataset" {
 		return "", errs.Usage("swpc has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
-}
-
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
-func mapErr(err error) error {
-	return err
+	return "https://www.swpc.noaa.gov/products/" + id, nil
 }
