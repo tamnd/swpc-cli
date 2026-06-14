@@ -1,39 +1,49 @@
 // Package swpc is the library behind the swpc command line:
-// the HTTP client, request shaping, and the typed data models for swpc.
+// the HTTP client, request shaping, and the typed data models for NOAA SWPC.
 //
 // The Client here is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
 // transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
 package swpc
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
-	"regexp"
-	"strings"
+	"sort"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to swpc. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "swpc/dev (+https://github.com/tamnd/swpc-cli)"
+// Host is the NOAA SWPC API hostname.
+const Host = "services.swpc.noaa.gov"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at swpc.com; change it once you
-// know the real endpoints you want to read.
-const Host = "swpc.com"
+// Config holds the client configuration.
+type Config struct {
+	BaseURL   string
+	UserAgent string
+	Rate      time.Duration
+	Retries   int
+	Timeout   time.Duration
+}
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+// DefaultConfig returns sensible defaults for the SWPC client.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   "https://services.swpc.noaa.gov",
+		UserAgent: "tamnd-swpc-cli/0.1 (tamnd87@gmail.com)",
+		Rate:      200 * time.Millisecond,
+		Retries:   3,
+		Timeout:   15 * time.Second,
+	}
+}
 
-// Client talks to swpc over HTTP.
+// Client talks to the NOAA SWPC API over HTTP.
 type Client struct {
 	HTTP      *http.Client
 	UserAgent string
+	BaseURL   string
 	// Rate is the minimum gap between requests. Zero means no pacing.
 	Rate    time.Duration
 	Retries int
@@ -41,20 +51,20 @@ type Client struct {
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
+// NewClient returns a Client with sensible defaults.
 func NewClient() *Client {
+	cfg := DefaultConfig()
 	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		HTTP:      &http.Client{Timeout: cfg.Timeout},
+		UserAgent: cfg.UserAgent,
+		BaseURL:   cfg.BaseURL,
+		Rate:      cfg.Rate,
+		Retries:   cfg.Retries,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
+// Get fetches rawURL and returns the response body. It paces and retries
+// according to the client's settings.
 func (c *Client) Get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.Retries; attempt++ {
@@ -124,110 +134,209 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on swpc.com. It is a stand-in for the typed records you
-// will model from the real swpc endpoints.
-//
-// The kit struct tags make it addressable as a resource URI (see domain.go): ID
-// is the URI id, and Body is the long text `swpc cat` and the Markdown
-// export print. The table tags shape the terminal grid (`-o table`) without
-// touching the JSON: URL is flagged the canonical column the `url` format prints,
-// and Body is hidden from the grid with `table:"-"` because a long preview wrecks
-// a row, though it still rides in `-o json` and `swpc cat`. Swap `-` for
-// `table:"body,truncate"` if you would rather clip it to the terminal width.
-type Page struct {
-	ID    string `json:"id" kit:"id" table:"id"`
-	URL   string `json:"url" table:"url,url"`
-	Title string `json:"title,omitempty" table:"title"`
-	Body  string `json:"body,omitempty" kit:"body" table:"-"`
+// --- Output types ---
+
+// KIndex is one planetary K-index reading.
+type KIndex struct {
+	Time         string  `json:"time" kit:"id"`
+	Kp           float64 `json:"kp"`
+	ARunning     float64 `json:"a_running"`
+	StationCount int     `json:"station_count"`
+	Activity     string  `json:"activity"`
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
+// SolarWind is a solar wind speed reading.
+type SolarWind struct {
+	Time        string `json:"time" kit:"id"`
+	ProtonSpeed int    `json:"proton_speed_km_s"`
+}
+
+// SpaceAlert is a NOAA space weather alert or watch.
+type SpaceAlert struct {
+	ProductID string `json:"product_id" kit:"id"`
+	IssuedAt  string `json:"issued_at"`
+	Message   string `json:"message"`
+}
+
+// SolarFlare is a record of a solar flare event.
+type SolarFlare struct {
+	BeginTime  string `json:"begin_time" kit:"id"`
+	MaxTime    string `json:"max_time"`
+	EndTime    string `json:"end_time"`
+	BeginClass string `json:"begin_class"`
+	MaxClass   string `json:"max_class"`
+	Satellite  int    `json:"satellite"`
+}
+
+// kpActivity maps a Kp value to a human-readable activity description.
+func kpActivity(kp float64) string {
+	switch {
+	case kp >= 9:
+		return "Extreme Storm"
+	case kp >= 8:
+		return "Strong Storm"
+	case kp >= 7:
+		return "Moderate Storm"
+	case kp >= 5:
+		return "Minor Storm"
+	case kp >= 4:
+		return "Active"
+	case kp >= 2:
+		return "Unsettled"
+	default:
+		return "Quiet"
+	}
+}
+
+// --- Wire types (JSON shapes from the API) ---
+
+type wireKIndex struct {
+	TimeTag      string  `json:"time_tag"`
+	Kp           float64 `json:"Kp"`
+	ARunning     float64 `json:"a_running"`
+	StationCount int     `json:"station_count"`
+}
+
+type wireSolarWind struct {
+	TimeTag     string `json:"time_tag"`
+	ProtonSpeed int    `json:"proton_speed"`
+}
+
+type wireAlert struct {
+	ProductID     string `json:"product_id"`
+	IssueDateTime string `json:"issue_datetime"`
+	Message       string `json:"message"`
+}
+
+type wireFlare struct {
+	TimeTag    string `json:"time_tag"`
+	BeginTime  string `json:"begin_time"`
+	BeginClass string `json:"begin_class"`
+	MaxTime    string `json:"max_time"`
+	MaxClass   string `json:"max_class"`
+	EndTime    string `json:"end_time"`
+	EndClass   string `json:"end_class"`
+	Satellite  int    `json:"satellite"`
+}
+
+// --- API methods ---
+
+// GetKIndex fetches the planetary K-index history.
+// It returns the last limit records (all if limit <= 0).
+func (c *Client) GetKIndex(ctx context.Context, limit int) ([]KIndex, error) {
+	url := c.BaseURL + "/products/noaa-planetary-k-index.json"
 	body, err := c.Get(ctx, url)
 	if err != nil {
 		return nil, err
 	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
 
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
+	var wire []wireKIndex
+	if err := json.Unmarshal(body, &wire); err != nil {
+		return nil, fmt.Errorf("decode k-index: %w", err)
 	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
+
+	out := make([]KIndex, 0, len(wire))
+	for _, w := range wire {
+		out = append(out, KIndex{
+			Time:         w.TimeTag,
+			Kp:           w.Kp,
+			ARunning:     w.ARunning,
+			StationCount: w.StationCount,
+			Activity:     kpActivity(w.Kp),
+		})
+	}
+
+	if limit > 0 && len(out) > limit {
+		out = out[len(out)-limit:]
 	}
 	return out, nil
 }
 
-// Search fetches the site's search results for query and returns the matching
-// pages as stubs, the same shape PageLinks emits, so every hit is an addressable
-// swpc.com page URI a host can follow. Like the rest of the scaffold it is a
-// stand-in: it reads the links out of a results page rather than a real search
-// API. Point it at the real endpoint and parse the real result shape once you
-// know it.
-func (c *Client) Search(ctx context.Context, query string, limit int) ([]*Page, error) {
-	body, err := c.Get(ctx, BaseURL+"/search?q="+url.QueryEscape(query))
+// GetSolarWind fetches the current solar wind speed.
+func (c *Client) GetSolarWind(ctx context.Context) (*SolarWind, error) {
+	url := c.BaseURL + "/products/summary/solar-wind-speed.json"
+	body, err := c.Get(ctx, url)
 	if err != nil {
 		return nil, err
 	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
+
+	var wire []wireSolarWind
+	if err := json.Unmarshal(body, &wire); err != nil {
+		return nil, fmt.Errorf("decode solar-wind: %w", err)
+	}
+	if len(wire) == 0 {
+		return nil, fmt.Errorf("no solar wind data returned")
+	}
+
+	w := wire[0]
+	return &SolarWind{
+		Time:        w.TimeTag,
+		ProtonSpeed: w.ProtonSpeed,
+	}, nil
+}
+
+// GetAlerts fetches current space weather alerts and watches.
+// It returns up to limit records (all if limit <= 0).
+func (c *Client) GetAlerts(ctx context.Context, limit int) ([]SpaceAlert, error) {
+	url := c.BaseURL + "/products/alerts.json"
+	body, err := c.Get(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+
+	var wire []wireAlert
+	if err := json.Unmarshal(body, &wire); err != nil {
+		return nil, fmt.Errorf("decode alerts: %w", err)
+	}
+
+	out := make([]SpaceAlert, 0, len(wire))
+	for _, w := range wire {
+		out = append(out, SpaceAlert{
+			ProductID: w.ProductID,
+			IssuedAt:  w.IssueDateTime,
+			Message:   w.Message,
+		})
+	}
+
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
 	}
 	return out, nil
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
+// GetFlares fetches solar flares from the last 7 days.
+// Results are sorted descending by begin_time. It returns up to limit records (all if limit <= 0).
+func (c *Client) GetFlares(ctx context.Context, limit int) ([]SolarFlare, error) {
+	url := c.BaseURL + "/json/goes/primary/xray-flares-7-day.json"
+	body, err := c.Get(ctx, url)
+	if err != nil {
+		return nil, err
 	}
-	return out
-}
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
+	var wire []wireFlare
+	if err := json.Unmarshal(body, &wire); err != nil {
+		return nil, fmt.Errorf("decode flares: %w", err)
 	}
-	return s
+
+	// Sort descending by begin_time (most recent first).
+	sort.Slice(wire, func(i, j int) bool {
+		return wire[i].BeginTime > wire[j].BeginTime
+	})
+
+	out := make([]SolarFlare, 0, len(wire))
+	for _, w := range wire {
+		out = append(out, SolarFlare{
+			BeginTime:  w.BeginTime,
+			MaxTime:    w.MaxTime,
+			EndTime:    w.EndTime,
+			BeginClass: w.BeginClass,
+			MaxClass:   w.MaxClass,
+			Satellite:  w.Satellite,
+		})
+	}
+
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }
